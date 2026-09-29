@@ -483,7 +483,51 @@ rtsp_notify_changes = if set to true, will send an event to connected users when
 }
 \endverbatim
  *
- * Finally, you can record a mountpoint to the internal Janus .mjr format
+ * RTP mountpoints can also forward a copy of the RTP packets they receive
+ * (already decrypted, in case the mountpoint uses SRTP) to another UDP
+ * address, for instance to feed a second mountpoint on the same Janus
+ * instance that advertises different codec parameters. Forwarders are
+ * runtime state: they are not saved anywhere and go away together with
+ * the mountpoint. Only IPv4 destinations are supported, and only the
+ * first video substream is forwarded. To add forwarders, use the
+ * \c rtp_forward request:
+ *
+\verbatim
+{
+	"request" : "rtp_forward",
+	"id" : <unique ID of the RTP mountpoint to forward from; mandatory>,
+	"secret" : "<secret of the mountpoint; mandatory if configured>",
+	"host" : "<IPv4 address to forward the RTP packets to; mandatory>",
+	"audio_port" : <port to forward audio to; optional>,
+	"audio_pt" : <payload type to use for forwarded audio packets; optional, unchanged by default>,
+	"audio_ssrc" : <SSRC to use for forwarded audio packets; optional, unchanged by default>,
+	"video_port" : <port to forward video to; optional>,
+	"video_pt" : <payload type to use for forwarded video packets; optional, unchanged by default>,
+	"video_ssrc" : <SSRC to use for forwarded video packets; optional, unchanged by default>,
+	"srtp_suite" : <32 or 80, to forward as SRTP with that authentication tag length; optional>,
+	"srtp_crypto" : "<base64 encoded key+salt to use for SRTP, mandatory when srtp_suite is set>"
+}
+\endverbatim
+ *
+ * At least one of \c audio_port and \c video_port is needed. If successful,
+ * the identifiers of the new forwarders are returned:
+ *
+\verbatim
+{
+	"streaming" : "forward",
+	"id" : <unique ID of the mountpoint>,
+	"audio_stream_id" : <unique ID of the audio forwarder, if any>,
+	"video_stream_id" : <unique ID of the video forwarder, if any>
+}
+\endverbatim
+ *
+ * Forwarders can be listed with \c listforwarders (with just \c id and
+ * \c secret, returning a \c rtp_forwarders array), and removed with the
+ * \c stop_rtp_forward request (with \c id, \c secret and the \c stream_id
+ * of the forwarder to remove, returning \c stop_forward).
+ *
+ *
+ * You can also record a mountpoint to the internal Janus .mjr format
  * using the \c recording request. The same request can also be used to
  * stop recording. Although the same request is used in both cases, though,
  * the syntax for the two use cases differs a bit, namely in terms of the
@@ -767,6 +811,7 @@ rtsp_notify_changes = if set to true, will send an event to connected users when
 #include "../mutex.h"
 #include "../rtp.h"
 #include "../rtpsrtp.h"
+#include "../rtpfwd.h"
 #include "../rtcp.h"
 #include "../record.h"
 #include "../utils.h"
@@ -969,6 +1014,20 @@ static struct janus_json_parameter rtp_data_parameters[] = {
 };
 static struct janus_json_parameter destroy_parameters[] = {
 	{"permanent", JANUS_JSON_BOOL, 0}
+};
+static struct janus_json_parameter rtp_forward_parameters[] = {
+	{"host", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
+	{"audio_port", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"audio_pt", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"audio_ssrc", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"video_port", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"video_pt", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"video_ssrc", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"srtp_suite", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"srtp_crypto", JSON_STRING, 0}
+};
+static struct janus_json_parameter stop_rtp_forward_parameters[] = {
+	{"stream_id", JSON_INTEGER, JANUS_JSON_PARAM_REQUIRED | JANUS_JSON_PARAM_POSITIVE}
 };
 static struct janus_json_parameter recording_parameters[] = {
 	{"action", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
@@ -1180,7 +1239,14 @@ typedef struct janus_streaming_rtp_source {
 	gboolean e2ee;
 	/* Whether the playout-delay extension should be negotiated or not for new subscribers */
 	gboolean playoutdelay_ext;
+	/* RTP forwarders: copies of the (decrypted) RTP packets sent to other UDP addresses (stream_id --> janus_rtp_forwarder) */
+	janus_mutex rtpfwd_mutex;
+	GHashTable *audio_forwarders, *video_forwarders;
+	int rtpfwd_fd;
 } janus_streaming_rtp_source;
+static janus_rtp_forwarder *janus_streaming_rtpfwd_add(janus_streaming_rtp_source *source, gboolean video,
+	const char *host, int port, int pt, uint32_t ssrc, int srtp_suite, const char *srtp_crypto);
+static json_t *janus_streaming_rtpfwd_summary(janus_rtp_forwarder *rf);
 
 typedef struct janus_streaming_file_source {
 	char *filename;
@@ -4529,6 +4595,167 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 		response = json_object();
 		json_object_set_new(response, "streaming", json_string("ok"));
 		goto prepare_response;
+	} else if(!strcasecmp(request_text, "rtp_forward") || !strcasecmp(request_text, "stop_rtp_forward")
+			|| !strcasecmp(request_text, "listforwarders")) {
+		/* A request to add, remove or list the RTP forwarders of a mountpoint */
+		gboolean add = !strcasecmp(request_text, "rtp_forward");
+		gboolean stop = !strcasecmp(request_text, "stop_rtp_forward");
+		if(!string_ids) {
+			JANUS_VALIDATE_JSON_OBJECT(root, id_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_STREAMING_ERROR_MISSING_ELEMENT, JANUS_STREAMING_ERROR_INVALID_ELEMENT);
+		} else {
+			JANUS_VALIDATE_JSON_OBJECT(root, idstr_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_STREAMING_ERROR_MISSING_ELEMENT, JANUS_STREAMING_ERROR_INVALID_ELEMENT);
+		}
+		if(error_code != 0)
+			goto prepare_response;
+		if(add) {
+			JANUS_VALIDATE_JSON_OBJECT(root, rtp_forward_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_STREAMING_ERROR_MISSING_ELEMENT, JANUS_STREAMING_ERROR_INVALID_ELEMENT);
+		} else if(stop) {
+			JANUS_VALIDATE_JSON_OBJECT(root, stop_rtp_forward_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_STREAMING_ERROR_MISSING_ELEMENT, JANUS_STREAMING_ERROR_INVALID_ELEMENT);
+		}
+		if(error_code != 0)
+			goto prepare_response;
+		json_t *id = json_object_get(root, "id");
+		guint64 id_value = 0;
+		char id_num[30], *id_value_str = NULL;
+		if(!string_ids) {
+			id_value = json_integer_value(id);
+			g_snprintf(id_num, sizeof(id_num), "%"SCNu64, id_value);
+			id_value_str = id_num;
+		} else {
+			id_value_str = (char *)json_string_value(id);
+		}
+		janus_mutex_lock(&mountpoints_mutex);
+		janus_streaming_mountpoint *mp = g_hash_table_lookup(mountpoints,
+			string_ids ? (gpointer)id_value_str : (gpointer)&id_value);
+		if(mp == NULL) {
+			janus_mutex_unlock(&mountpoints_mutex);
+			JANUS_LOG(LOG_VERB, "No such mountpoint/stream %s\n", id_value_str);
+			error_code = JANUS_STREAMING_ERROR_NO_SUCH_MOUNTPOINT;
+			g_snprintf(error_cause, 512, "No such mountpoint/stream %s", id_value_str);
+			goto prepare_response;
+		}
+		janus_refcount_increase(&mp->ref);
+		/* A secret is required for this action, if the mountpoint has one */
+		JANUS_CHECK_SECRET(mp->secret, root, "secret", error_code, error_cause,
+			JANUS_STREAMING_ERROR_MISSING_ELEMENT, JANUS_STREAMING_ERROR_INVALID_ELEMENT, JANUS_STREAMING_ERROR_UNAUTHORIZED);
+		if(error_code != 0) {
+			janus_refcount_decrease(&mp->ref);
+			janus_mutex_unlock(&mountpoints_mutex);
+			goto prepare_response;
+		}
+		if(mp->streaming_source != janus_streaming_source_rtp) {
+			janus_refcount_decrease(&mp->ref);
+			janus_mutex_unlock(&mountpoints_mutex);
+			error_code = JANUS_STREAMING_ERROR_INVALID_REQUEST;
+			g_snprintf(error_cause, 512, "Mountpoint/stream %s is not an RTP source", id_value_str);
+			goto prepare_response;
+		}
+		janus_streaming_rtp_source *source = mp->source;
+		response = json_object();
+		json_object_set_new(response, "streaming", json_string(add ? "forward" : (stop ? "stop_forward" : "forwarders")));
+		json_object_set_new(response, "id", string_ids ? json_string(id_value_str) : json_integer(id_value));
+		if(add) {
+			/* Forwarding is limited to IPv4, as the forwarders share a single IPv4 socket */
+			const char *host = json_string_value(json_object_get(root, "host"));
+			struct in_addr addr;
+			int audio_port = json_integer_value(json_object_get(root, "audio_port"));
+			int video_port = json_integer_value(json_object_get(root, "video_port"));
+			int srtp_suite = json_integer_value(json_object_get(root, "srtp_suite"));
+			const char *srtp_crypto = json_string_value(json_object_get(root, "srtp_crypto"));
+			if(inet_pton(AF_INET, host, &addr) != 1) {
+				error_code = JANUS_STREAMING_ERROR_INVALID_ELEMENT;
+				g_snprintf(error_cause, 512, "Invalid element (host must be an IPv4 address)");
+			} else if(audio_port == 0 && video_port == 0) {
+				error_code = JANUS_STREAMING_ERROR_MISSING_ELEMENT;
+				g_snprintf(error_cause, 512, "Missing element (audio_port and/or video_port)");
+			} else if((audio_port > 0 && mp->codecs.audio_pt < 0) || (video_port > 0 && mp->codecs.video_pt < 0)) {
+				error_code = JANUS_STREAMING_ERROR_INVALID_ELEMENT;
+				g_snprintf(error_cause, 512, "Invalid element (the mountpoint has no such media)");
+			} else if((srtp_suite > 0) != (srtp_crypto != NULL) || (srtp_suite > 0 && srtp_suite != 32 && srtp_suite != 80)) {
+				error_code = JANUS_STREAMING_ERROR_INVALID_ELEMENT;
+				g_snprintf(error_cause, 512, "Invalid element (srtp_suite must be 32 or 80, and be provided together with srtp_crypto)");
+			}
+			if(error_code == 0) {
+				janus_mutex_lock(&source->rtpfwd_mutex);
+				if(source->rtpfwd_fd < 0)
+					source->rtpfwd_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+				if(source->rtpfwd_fd < 0) {
+					error_code = JANUS_STREAMING_ERROR_UNKNOWN_ERROR;
+					g_snprintf(error_cause, 512, "Error creating the RTP forwarders socket: %s", g_strerror(errno));
+				}
+				janus_rtp_forwarder *audio_rf = NULL, *video_rf = NULL;
+				if(error_code == 0 && audio_port > 0) {
+					audio_rf = janus_streaming_rtpfwd_add(source, FALSE, host, audio_port,
+						json_integer_value(json_object_get(root, "audio_pt")),
+						json_integer_value(json_object_get(root, "audio_ssrc")), srtp_suite, srtp_crypto);
+					if(audio_rf == NULL) {
+						error_code = JANUS_STREAMING_ERROR_UNKNOWN_ERROR;
+						g_snprintf(error_cause, 512, "Error creating the audio RTP forwarder");
+					}
+				}
+				if(error_code == 0 && video_port > 0) {
+					video_rf = janus_streaming_rtpfwd_add(source, TRUE, host, video_port,
+						json_integer_value(json_object_get(root, "video_pt")),
+						json_integer_value(json_object_get(root, "video_ssrc")), srtp_suite, srtp_crypto);
+					if(video_rf == NULL) {
+						error_code = JANUS_STREAMING_ERROR_UNKNOWN_ERROR;
+						g_snprintf(error_cause, 512, "Error creating the video RTP forwarder");
+						if(audio_rf != NULL)
+							g_hash_table_remove(source->audio_forwarders, GUINT_TO_POINTER(audio_rf->stream_id));
+					}
+				}
+				if(error_code == 0) {
+					if(audio_rf != NULL)
+						json_object_set_new(response, "audio_stream_id", json_integer(audio_rf->stream_id));
+					if(video_rf != NULL)
+						json_object_set_new(response, "video_stream_id", json_integer(video_rf->stream_id));
+					JANUS_LOG(LOG_INFO, "[%s] Added RTP forwarder(s) to %s (audio=%d, video=%d)\n",
+						mp->name, host, audio_port, video_port);
+				}
+				janus_mutex_unlock(&source->rtpfwd_mutex);
+			}
+		} else if(stop) {
+			guint32 stream_id = json_integer_value(json_object_get(root, "stream_id"));
+			janus_mutex_lock(&source->rtpfwd_mutex);
+			gboolean found = g_hash_table_remove(source->audio_forwarders, GUINT_TO_POINTER(stream_id));
+			if(!found)
+				found = g_hash_table_remove(source->video_forwarders, GUINT_TO_POINTER(stream_id));
+			janus_mutex_unlock(&source->rtpfwd_mutex);
+			if(!found) {
+				error_code = JANUS_STREAMING_ERROR_INVALID_ELEMENT;
+				g_snprintf(error_cause, 512, "No such stream (%"SCNu32")", stream_id);
+			} else {
+				json_object_set_new(response, "stream_id", json_integer(stream_id));
+			}
+		} else {
+			json_t *list = json_array();
+			GHashTableIter iter;
+			gpointer value;
+			janus_mutex_lock(&source->rtpfwd_mutex);
+			g_hash_table_iter_init(&iter, source->audio_forwarders);
+			while(g_hash_table_iter_next(&iter, NULL, &value))
+				json_array_append_new(list, janus_streaming_rtpfwd_summary((janus_rtp_forwarder *)value));
+			g_hash_table_iter_init(&iter, source->video_forwarders);
+			while(g_hash_table_iter_next(&iter, NULL, &value))
+				json_array_append_new(list, janus_streaming_rtpfwd_summary((janus_rtp_forwarder *)value));
+			janus_mutex_unlock(&source->rtpfwd_mutex);
+			json_object_set_new(response, "rtp_forwarders", list);
+		}
+		janus_refcount_decrease(&mp->ref);
+		janus_mutex_unlock(&mountpoints_mutex);
+		if(error_code != 0) {
+			json_decref(response);
+			response = NULL;
+		}
+		goto prepare_response;
 	} else {
 		/* Not a request we recognize, don't do anything */
 		return NULL;
@@ -6282,6 +6509,71 @@ static int janus_streaming_get_fd_port(int fd) {
 }
 
 /* Helpers to destroy a streaming mountpoint. */
+/* RTP forwarders helpers */
+static void janus_streaming_rtpfwd_init(janus_streaming_rtp_source *source) {
+	janus_mutex_init(&source->rtpfwd_mutex);
+	source->audio_forwarders = g_hash_table_new_full(NULL, NULL,
+		NULL, (GDestroyNotify)janus_rtp_forwarder_destroy);
+	source->video_forwarders = g_hash_table_new_full(NULL, NULL,
+		NULL, (GDestroyNotify)janus_rtp_forwarder_destroy);
+	source->rtpfwd_fd = -1;
+}
+
+static void janus_streaming_rtpfwd_free(janus_streaming_rtp_source *source) {
+	janus_mutex_lock(&source->rtpfwd_mutex);
+	if(source->audio_forwarders != NULL)
+		g_hash_table_destroy(source->audio_forwarders);
+	source->audio_forwarders = NULL;
+	if(source->video_forwarders != NULL)
+		g_hash_table_destroy(source->video_forwarders);
+	source->video_forwarders = NULL;
+	if(source->rtpfwd_fd > -1)
+		close(source->rtpfwd_fd);
+	source->rtpfwd_fd = -1;
+	janus_mutex_unlock(&source->rtpfwd_mutex);
+}
+
+/* Send a copy of an RTP packet to all the forwarders of the given media (only substream 0 is forwarded) */
+static void janus_streaming_rtpfwd_send(janus_streaming_rtp_source *source, gboolean video, char *buffer, int len) {
+	janus_mutex_lock(&source->rtpfwd_mutex);
+	GHashTable *forwarders = video ? source->video_forwarders : source->audio_forwarders;
+	if(forwarders != NULL && g_hash_table_size(forwarders) > 0) {
+		GHashTableIter iter;
+		gpointer value;
+		g_hash_table_iter_init(&iter, forwarders);
+		while(g_hash_table_iter_next(&iter, NULL, &value))
+			janus_rtp_forwarder_send_rtp((janus_rtp_forwarder *)value, buffer, len, 0);
+	}
+	janus_mutex_unlock(&source->rtpfwd_mutex);
+}
+
+static janus_rtp_forwarder *janus_streaming_rtpfwd_add(janus_streaming_rtp_source *source, gboolean video,
+		const char *host, int port, int pt, uint32_t ssrc, int srtp_suite, const char *srtp_crypto) {
+	janus_rtp_forwarder *rf = janus_rtp_forwarder_create(JANUS_STREAMING_NAME, 0, source->rtpfwd_fd,
+		host, port, ssrc, pt, srtp_suite, srtp_crypto, FALSE, 0, video, FALSE);
+	if(rf == NULL)
+		return NULL;
+	g_hash_table_insert(video ? source->video_forwarders : source->audio_forwarders, GUINT_TO_POINTER(rf->stream_id), rf);
+	return rf;
+}
+
+static json_t *janus_streaming_rtpfwd_summary(janus_rtp_forwarder *rf) {
+	json_t *json = json_object();
+	json_object_set_new(json, "stream_id", json_integer(rf->stream_id));
+	json_object_set_new(json, "media", json_string(rf->is_video ? "video" : "audio"));
+	char address[INET_ADDRSTRLEN];
+	json_object_set_new(json, "host", json_string(
+		inet_ntop(AF_INET, &rf->serv_addr.sin_addr, address, sizeof(address))));
+	json_object_set_new(json, "port", json_integer(ntohs(rf->serv_addr.sin_port)));
+	if(rf->payload_type > 0)
+		json_object_set_new(json, "pt", json_integer(rf->payload_type));
+	if(rf->ssrc)
+		json_object_set_new(json, "ssrc", json_integer(rf->ssrc));
+	if(rf->is_srtp)
+		json_object_set_new(json, "srtp", json_true());
+	return json;
+}
+
 static void janus_streaming_rtp_source_free(gpointer data) {
 	janus_streaming_rtp_source *source = (janus_streaming_rtp_source *)data;
 	if(source->audio_fd > -1) {
@@ -6299,6 +6591,7 @@ static void janus_streaming_rtp_source_free(gpointer data) {
 	if(source->data_fd > -1) {
 		close(source->data_fd);
 	}
+	janus_streaming_rtpfwd_free(source);
 	if(source->audio_rtcp_fd > -1) {
 		close(source->audio_rtcp_fd);
 	}
@@ -6730,6 +7023,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 	live_rtp_source->buffermsg = buffermsg;
 	live_rtp_source->last_msg = NULL;
 	janus_mutex_init(&live_rtp_source->buffermsg_mutex);
+	janus_streaming_rtpfwd_init(live_rtp_source);
 	live_rtp->source = live_rtp_source;
 	live_rtp->source_destroy = (GDestroyNotify)janus_streaming_rtp_source_free;
 	live_rtp->codecs.audio_pt = doaudio ? acodec : -1;
@@ -7865,6 +8159,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 	live_rtsp_source->rtsp_conn_timeout = rtsp_conn_timeout;
 	live_rtsp_source->reconnect_timer = 0;
 	janus_mutex_init(&live_rtsp_source->rtsp_mutex);
+	janus_streaming_rtpfwd_init(live_rtsp_source);
 	live_rtsp->source = live_rtsp_source;
 	live_rtsp->source_destroy = (GDestroyNotify)janus_streaming_rtp_source_free;
 	live_rtsp->viewers = NULL;
@@ -8754,6 +9049,8 @@ static void *janus_streaming_relay_thread(void *data) {
 						packet.ptype = packet.data->type;
 						packet.timestamp = ntohl(packet.data->timestamp);
 						packet.seq_number = ntohs(packet.data->seq_number);
+						/* Forward a copy to the RTP forwarders, if any */
+						janus_streaming_rtpfwd_send(source, FALSE, (char *)packet.data, bytes);
 						/* Go! */
 						janus_mutex_lock(&mountpoint->mutex);
 						g_list_foreach(mountpoint->helper_threads == 0 ? mountpoint->viewers : mountpoint->threads,
@@ -8960,6 +9257,9 @@ static void *janus_streaming_relay_thread(void *data) {
 							packet.ssrc[1] = v_last_ssrc[1];
 							packet.ssrc[2] = v_last_ssrc[2];
 						}
+						/* Forward a copy to the RTP forwarders, if any (only the first substream) */
+						if(index == 0)
+							janus_streaming_rtpfwd_send(source, TRUE, (char *)packet.data, bytes);
 						/* Go! */
 						janus_mutex_lock(&mountpoint->mutex);
 						g_list_foreach(mountpoint->helper_threads == 0 ? mountpoint->viewers : mountpoint->threads,
